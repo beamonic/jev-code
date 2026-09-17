@@ -24252,6 +24252,7 @@ export class AgentSession {
 			let unavailableDefaultChainMessage: string | undefined;
 			let recoveredDefaultChainMessage: string | undefined;
 			let recoveredThinkingLevel: ThinkingLevel | undefined;
+			let recoveredProfileBindingsInstalled = false;
 			let durableDefaultRecoveryError: string | undefined;
 			let transitionCleanupCommitted = false;
 			let exactRetirement: PreparedExactMcpRetirement | undefined;
@@ -24398,6 +24399,7 @@ export class AgentSession {
 										});
 										targetActiveModelProfile = recovery.profileName;
 										targetProfileRuntimeInstalled = true;
+										recoveredProfileBindingsInstalled = true;
 									}
 									this.installRecoveredDefaultFallbackChain(
 										recovery.entries,
@@ -24485,7 +24487,9 @@ export class AgentSession {
 				if (switchingToDifferentSession) {
 					// Profile cleanup changed the active role layer; refresh eager task
 					// delegation and its base prompt before reconnecting the successor.
-					await this.syncEagerDelegation();
+					// Recovery binding installation already performs this refresh as a
+					// best-effort step, so do not repeat it as a fatal transaction step.
+					if (!recoveredProfileBindingsInstalled) await this.syncEagerDelegation();
 					// The local:// migration gate for this successor already ran above,
 					// before the identity was published (#2797 / #2925).
 					this.#resetHindsightConversationTrackingIfHindsight();
