@@ -13,12 +13,7 @@ import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version.js";
 import { SdkClient, SdkClientError } from "../src/sdk/client/client.js";
 import { listSdkSessionEndpoints } from "../src/sdk/client/discovery.js";
 import { classifyEndpoint, selectLiveEndpoint } from "../src/sdk/client/liveness.js";
-import {
-	relayClientHelloFromServerHello,
-	type RelayWebSocket,
-	startRelayPair,
-	type TransportError,
-} from "../src/sdk/transport/relay.js";
+import { type RelayWebSocket, startRelayPair, type TransportError } from "../src/sdk/transport/relay.js";
 import {
 	listBrokerSessions,
 	resolveServePendingCeiling,
@@ -81,6 +76,7 @@ function upstream() {
 		websocket: {
 			open(ws) {
 				connections.push({ ws, messages: [] });
+				ws.send(JSON.stringify({ type: "hello", connectionId: "fixture" }));
 			},
 			message(ws, message) {
 				connections.find(connection => connection.ws === ws)?.messages.push(String(message));
@@ -277,6 +273,10 @@ class StalledWebSocket implements RelayWebSocket {
 		this.#emit("open");
 	}
 
+	message(data: string): void {
+		this.#emit("message", { data });
+	}
+
 	send(data: string): void {
 		this.messages.push(data);
 		this.#bufferedAmount += Buffer.byteLength(data);
@@ -344,6 +344,8 @@ async function relayFixture(pendingCeilingBytes = 256 * 1024, validateDownstream
 				validateDownstreamFrame,
 			});
 			await waitFor(() => fake.connections[0], "upstream connection");
+			await waitFor(() => received[0], "upstream hello");
+			received.length = 0;
 			expect(retryCount).toBeLessThanOrEqual(1);
 			return { fake, input, output, received, errors, pair };
 		} catch (error) {
@@ -360,7 +362,7 @@ async function relayFixture(pendingCeilingBytes = 256 * 1024, validateDownstream
 }
 
 describe("SDK serve raw relay", () => {
-	test("negotiates upstream capabilities so a mid-turn tool_activity reaches stdio", async () => {
+	test("forwards the downstream capability selection after a production-style minimal hello", async () => {
 		const connections: { ws: ServerWebSocket<unknown>; messages: string[] }[] = [];
 		const server = Bun.serve<unknown>({
 			port: 0,
@@ -371,6 +373,7 @@ describe("SDK serve raw relay", () => {
 			websocket: {
 				open(ws) {
 					connections.push({ ws, messages: [] });
+					ws.send(JSON.stringify({ type: "hello", connectionId: "session" }));
 				},
 				message(ws, message) {
 					const connection = connections.find(candidate => candidate.ws === ws);
@@ -409,8 +412,8 @@ describe("SDK serve raw relay", () => {
 		});
 		try {
 			await waitFor(() => connections[0], "upstream connection");
-			connections[0]!.ws.send(
-				JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["tool_activity_v2", "turn_stream"] }),
+			input.write(
+				`${JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["tool_activity_v2", "turn_stream"] })}\n`,
 			);
 			const toolActivity = await waitFor(
 				() =>
@@ -438,15 +441,58 @@ describe("SDK serve raw relay", () => {
 		}
 	});
 
-	test("derives the relay hello capability list from the upstream advertisement", () => {
-		const serverHello = JSON.stringify({
-			type: "hello",
-			protocolVersion: 3,
-			capabilities: ["tool_activity_v2", "turn_stream", "tool_activity_v2"],
+	test("buffers downstream frames until the upstream hello and preserves empty or future capabilities", async () => {
+		const connections: { ws: ServerWebSocket<unknown>; messages: string[] }[] = [];
+		const server = Bun.serve<unknown>({
+			port: 0,
+			fetch(_request, instance) {
+				if (instance.upgrade(_request, { data: {} })) return;
+				return new Response("upgrade required", { status: 426 });
+			},
+			websocket: {
+				open(ws) {
+					connections.push({ ws, messages: [] });
+				},
+				message(ws, message) {
+					connections.find(candidate => candidate.ws === ws)?.messages.push(String(message));
+				},
+			},
 		});
-		expect(relayClientHelloFromServerHello(serverHello)).toBe(
-			JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["tool_activity_v2", "turn_stream"] }),
-		);
+		const input = new PassThrough();
+		const output = new PassThrough();
+		const received: Buffer[] = [];
+		output.on("data", chunk => received.push(Buffer.from(chunk)));
+		const pair = await startRelayPair({
+			url: `ws://127.0.0.1:${server.port}`,
+			token,
+			pendingCeilingBytes: 256 * 1024,
+			downstream: input,
+			downstreamSink: output,
+			onTransportError: () => {},
+		});
+		try {
+			const connection = await waitFor(() => connections[0], "upstream connection");
+			await Bun.sleep(20);
+			expect(connection.messages).toEqual([]);
+			const emptyHello = JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: [] });
+			const futureHello = JSON.stringify({
+				type: "hello",
+				protocolVersion: 3,
+				capabilities: ["unrelated_future_capability"],
+			});
+			input.write(`${emptyHello}\n${futureHello}\n`);
+			await Bun.sleep(20);
+			expect(connection.messages).toEqual([]);
+			connection.ws.send(JSON.stringify({ type: "hello", connectionId: "session" }));
+			expect(await waitFor(() => connection.messages[0], "buffered downstream hello")).toBe(emptyHello);
+			expect(await waitFor(() => connection.messages[1], "buffered future hello")).toBe(futureHello);
+			expect(received.map(chunk => chunk.toString().trim())).toContain(
+				JSON.stringify({ type: "hello", connectionId: "session" }),
+			);
+		} finally {
+			await pair.close();
+			server.stop(true);
+		}
 	});
 
 	test("preserves non-canonical JSON bytes in both directions", async () => {
@@ -524,6 +570,8 @@ describe("SDK serve raw relay", () => {
 				onTransportError: error => errors.push(error),
 			});
 			const connection = await waitFor(() => fixture.fake.connections[1], "second upstream connection");
+			await Bun.sleep(20);
+			blocked.emit("drain");
 			connection.ws.send("a".repeat(8 * 1024 * 1024 + 1));
 			await Bun.sleep(20);
 			expect(errors).toEqual([]);
@@ -556,6 +604,7 @@ describe("SDK serve raw relay", () => {
 			});
 			const ws = await waitFor(() => StalledWebSocket.latest, "fake websocket");
 			ws.open();
+			ws.message(JSON.stringify({ type: "hello", connectionId: "stalled" }));
 			const pair = await started;
 			try {
 				input.write('{"active":true}\n');
@@ -587,6 +636,7 @@ describe("SDK serve raw relay", () => {
 			});
 			const ws = await waitFor(() => StalledWebSocket.latest, "fake websocket");
 			ws.open();
+			ws.message(JSON.stringify({ type: "hello", connectionId: "stalled" }));
 			const pair = await started;
 			try {
 				const frame = "x".repeat(256 * 1024);
@@ -646,6 +696,7 @@ describe("SDK socket serve", () => {
 				const ws = await waitFor(() => StalledWebSocket.latest, "upstream dial");
 				client.write('{"received":"during-dial"}\n');
 				ws.open();
+				ws.message(JSON.stringify({ type: "hello", connectionId: "stalled" }));
 				expect(await waitFor(() => ws.messages[0], "handed-off frame")).toBe('{"received":"during-dial"}');
 			} finally {
 				await closeSocket(client);
